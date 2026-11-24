@@ -1,6 +1,7 @@
 #include "ws_client.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <iostream>
 #include <random>
@@ -746,8 +747,43 @@ ssl_context_ptr WsClient::OnTlsInit(websocketpp::connection_hdl) {
   return ctx;
 }
 
+namespace {
+// The official signaling server is the only host whose certificate is fully
+// verified. A self-hosted server uses a self-signed certificate that no
+// system trust store knows about, and the user has explicitly chosen that
+// server in the client settings, so its certificate is not authenticated.
+// The channel is still TLS-encrypted; only certificate authentication is
+// skipped. This intentionally deviates from "Never downgrade signaling TLS"
+// in signal_server_address.h, but only for non-official hosts.
+// Host comparison is case-insensitive (DNS names are case-insensitive).
+// An unparsable URI fails closed: verification is kept.
+bool IsOfficialSignalHost(const std::string& uri) {
+  static const std::string kOfficialHost = "api.crossdesk.cn";
+  std::string host;
+  try {
+    host = websocketpp::uri(uri).get_host();
+  } catch (...) {
+    return false;
+  }
+  if (host.size() != kOfficialHost.size()) return false;
+  for (size_t i = 0; i < host.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(host[i])) != kOfficialHost[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+}  // namespace
+
 bool WsClient::OnTlsVerify(bool preverified,
                            websocketpp::lib::asio::ssl::verify_context& ctx) {
+  // Self-hosted server: skip certificate verification. Official server:
+  // fall through to the full verification below, unchanged.
+  if (!IsOfficialSignalHost(uri_)) {
+    tls_failure_count_ = 0;
+    return true;
+  }
+
   if (!preverified &&
       VerifyTlsWithSystemTrust(ctx.native_handle(), uri_)) {
     tls_failure_count_ = 0;
